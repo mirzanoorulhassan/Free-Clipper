@@ -3,15 +3,14 @@
 
     PEAKCUT_AI_PROVIDER   gemini | openai | xai | groq | openrouter | anthropic | ollama | custom
     PEAKCUT_AI_MODELS     one or more model ids, comma separated, tried in this order
-    PEAKCUT_AI_KEY        your key (or PEAKCUT_AI_KEY_FILE, a file holding it)
+    PEAKCUT_AI_KEY        one or more keys, comma separated (or PEAKCUT_AI_KEY_FILE, a file holding them)
     PEAKCUT_AI_BASE_URL   only for "custom" (any service that speaks the OpenAI chat format), or to override
-
-Every service is asked for the same thing: JSON that follows a small schema. Gemini takes the schema directly.
-The others are told the schema in the prompt and asked for a JSON object, which works with any chat model."""
+"""
 import json
 import os
 import re
 import threading
+import time
 
 import httpx
 
@@ -34,6 +33,7 @@ NO_KEY = {"ollama", "custom"}       # a model running on your own machine needs 
 # ---------------------------------------------------------------- the settings in use
 _lock = threading.Lock()
 _saved = {"at": None, "data": {}}
+_key_index = 0
 
 
 def _file():
@@ -74,8 +74,38 @@ def models() -> list:
     return current()["models"]
 
 
+def keys() -> list:
+    """Split comma-separated keys into a clean list."""
+    raw = current()["key"]
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
 def key() -> str:
-    return current()["key"]
+    """Return the currently active key from the rotation pool."""
+    ks = keys()
+    if not ks:
+        return ""
+    return ks[_key_index % len(ks)]
+
+
+def _rotate_key() -> str:
+    """Advance to the next API key in the pool."""
+    global _key_index
+    ks = keys()
+    if len(ks) <= 1:
+        return ks[0] if ks else ""
+    with _lock:
+        _key_index = (_key_index + 1) % len(ks)
+        active = ks[_key_index]
+    print(f"[AI KeyRotator] Rate limit hit! Switched to key #{_key_index + 1}/{len(ks)} (...{active[-4:]})")
+    return active
+
+
+def _mask_keys(text: str) -> str:
+    for k in keys():
+        if k:
+            text = text.replace(k, "<key>")
+    return text
 
 
 def label() -> str:
@@ -89,23 +119,26 @@ def base_url() -> str:
 
 def ready() -> bool:
     c = current()
-    return bool(c["provider"] in PROVIDERS and c["models"] and base_url() and (c["key"] or c["provider"] in NO_KEY))
+    return bool(c["provider"] in PROVIDERS and c["models"] and base_url() and (keys() or c["provider"] in NO_KEY))
 
 
 def public() -> dict:
-    """What the settings page may see. The key itself never leaves the server: only whether there is one, and
-    its last four characters so the owner can tell which key it is."""
+    """What the settings page may see. The key itself never leaves the server."""
     c = current()
-    return {"provider": c["provider"], "models": c["models"], "base_url": c["base_url"], "has_key": bool(c["key"]),
-            "key_hint": c["key"][-4:] if len(c["key"]) >= 12 else "", "ready": ready(), "label": label(),
+    ks = keys()
+    active_k = key()
+    hint = active_k[-4:] if len(active_k) >= 8 else ""
+    if hint and len(ks) > 1:
+        hint = f"{hint} (+{len(ks) - 1} keys)"
+    return {"provider": c["provider"], "models": c["models"], "base_url": c["base_url"], "has_key": bool(ks),
+            "key_hint": hint, "ready": ready(), "label": label(),
             "saved_here": bool(_from_dashboard().get("provider")),
             "providers": [{"id": k, "label": v[0], "address": v[1], "needs_key": k not in NO_KEY, "key_url": v[3], "example": v[4]}
                           for k, v in PROVIDERS.items()]}
 
 
 def save(provider_id: str, model_ids, address: str = "", new_key=None) -> dict:
-    """Save the choice made in the dashboard. `new_key` None keeps the key that is already there (the page never
-    has it to send back); an empty string removes it."""
+    """Save the choice made in the dashboard."""
     p = ALIASES.get(str(provider_id or "").strip().lower(), str(provider_id or "").strip().lower())
     if p not in PROVIDERS:
         raise ValueError("Choose one of the AI services in the list.")
@@ -122,15 +155,16 @@ def save(provider_id: str, model_ids, address: str = "", new_key=None) -> dict:
     if p == "custom" and not address:
         raise ValueError("A custom service needs its address, for example http://127.0.0.1:1234/v1")
     old = current()
-    k = old["key"] if new_key is None and old["provider"] == p else str(new_key or "").strip()[:400]
+    # Allow up to 4000 chars so 20+ comma-separated keys fit easily
+    k = old["key"] if new_key is None and old["provider"] == p else str(new_key or "").strip()[:4000]
     if not k and p not in NO_KEY:
-        raise ValueError("Paste the key for this service.")
+        raise ValueError("Paste the key (or comma-separated keys) for this service.")
     with _lock:
         f = _file()
         tmp = f.with_suffix(".tmp")
         tmp.write_text(json.dumps({"provider": p, "models": ms, "base_url": address, "key": k}), encoding="utf-8")
         try:
-            os.chmod(tmp, 0o600)        # the key is only for whoever runs the server
+            os.chmod(tmp, 0o600)
         except OSError:
             pass
         tmp.replace(f)
@@ -144,7 +178,8 @@ def list_models(provider_id=None, address=None, with_key=None) -> list:
     p = ALIASES.get(str(provider_id or c["provider"]).lower(), str(provider_id or c["provider"]).lower())
     if p not in PROVIDERS:
         raise ValueError("Choose one of the AI services in the list.")
-    k = str(with_key or "").strip() or (c["key"] if c["provider"] == p else "")
+    raw_k = str(with_key or "").strip()
+    k = raw_k.split(",")[0].strip() if raw_k else (key() if c["provider"] == p else "")
     base = str(address or "").strip().rstrip("/") or (c["base_url"] if c["provider"] == p else "") or PROVIDERS[p][1]
     if not base:
         raise ValueError("Enter the service's address first.")
@@ -156,7 +191,7 @@ def list_models(provider_id=None, address=None, with_key=None) -> list:
     else:
         r = httpx.get(f"{base}/models", headers={"Authorization": f"Bearer {k}"} if k else {}, timeout=20)
     if r.status_code != 200:
-        raise AIError(f"HTTP {r.status_code} {r.text[:200].replace(k or chr(0), '<key>')}")
+        raise AIError(f"HTTP {r.status_code} {_mask_keys(r.text[:200])}")
     data = r.json()
     if how == "gemini":
         found = [m.get("name", "").split("/")[-1] for m in data.get("models", [])
@@ -179,7 +214,7 @@ class AIError(RuntimeError):
     pass
 
 
-problem = {"text": "", "at": 0.0}       # why the AI last failed, for the dashboard; cleared when it answers again
+problem = {"text": "", "at": 0.0}
 
 
 def explain(e) -> str:
@@ -191,14 +226,13 @@ def explain(e) -> str:
     if "401" in text or "403" in text or "api key" in low or "api_key" in low or "unauthorized" in low or "permission" in low:
         return f"{label()} refused the key. Paste a working key under Settings, AI."
     if "429" in text or "quota" in low or "rate limit" in low or "exhausted" in low:
-        return f"{label()} says the key has hit its limit or has no credit left. Check the account with {label()}, or try again later."
+        return f"{label()} says all keys have hit their limit or have no credit left. Add more keys or try again later."
     if "connect" in low or "timed out" in low or "timeout" in low or "getaddrinfo" in low or "refused" in low:
         return f"Peaksnip couldn't reach {label()}. Check the internet connection" + (" and that Ollama is running." if provider() == "ollama" else ".")
     return ""
 
 
 def note_problem(e):
-    import time
     why = explain(e)
     if why:
         problem.update(text=why, at=time.time())
@@ -209,8 +243,13 @@ def clear_problem():
 
 
 def _fail(r, model):
-    text = r.text[:300].replace(key() or "\0", "<key>")
+    text = _mask_keys(r.text[:300])
     raise AIError(f"HTTP {r.status_code} {text}")
+
+
+def _is_rate_limit(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(x in msg for x in ("429", "rate limit", "rate_limit", "quota", "exhausted", "too many requests", "resource_exhausted"))
 
 
 # ---------------------------------------------------------------- the schema, said in words for chat models
@@ -231,6 +270,7 @@ def _wrapped(prompt, schema):
 def _parse(text):
     """The JSON in an answer, even if the model wrapped it in a code fence or a sentence."""
     text = (text or "").strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
     try:
         out = json.loads(text)
@@ -244,11 +284,24 @@ def _parse(text):
     return out
 
 
-# ---------------------------------------------------------------- one call
+# ---------------------------------------------------------------- one call with automatic key rotation
 def call(model: str, prompt: str, schema: dict):
-    """Ask one model. Returns (the parsed JSON answer, tokens sent, tokens written back)."""
+    """Ask one model, rotating through all configured keys if a 429 / quota limit is hit."""
     how = PROVIDERS[provider()][2]
-    return {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how](model, prompt, schema)
+    fn = {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how]
+    attempts = max(1, len(keys()))
+    last_err = None
+    for _ in range(attempts):
+        try:
+            return fn(model, prompt, schema)
+        except Exception as e:
+            last_err = e
+            if _is_rate_limit(e) and len(keys()) > 1:
+                _rotate_key()
+                time.sleep(0.3)
+                continue
+            raise
+    raise last_err
 
 
 def _gemini(model, prompt, schema):
@@ -261,13 +314,12 @@ def _gemini(model, prompt, schema):
     text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
     u = data.get("usageMetadata", {})
     sent = int(u.get("promptTokenCount") or 0)
-    return json.loads(text), sent, max(0, int(u.get("totalTokenCount") or 0) - sent)   # the answer, and any thinking billed with it
+    return json.loads(text), sent, max(0, int(u.get("totalTokenCount") or 0) - sent)
 
 
 def _openai(model, prompt, schema):
     headers = {"Authorization": f"Bearer {key()}"} if key() else {}
     body = {"model": model, "messages": [{"role": "user", "content": _wrapped(prompt, schema)}]}
-    # Most services accept these two extras; a few models refuse one of them, so they are dropped on a refusal.
     extras = [{"temperature": 0.4, "response_format": {"type": "json_object"}}, {"response_format": {"type": "json_object"}}, {}]
     r = None
     for extra in extras:

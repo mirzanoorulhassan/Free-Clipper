@@ -126,7 +126,7 @@ AI_BASE_URL = env("PEAKCUT_AI_BASE_URL", "").rstrip("/")                      # 
 
 
 def ai_key() -> str:
-    return _secret("PEAKCUT_AI_KEY", "PEAKCUT_AI_KEY_FILE", r"\S{8,}")
+    return _secret("PEAKCUT_AI_KEY", "PEAKCUT_AI_KEY_FILE", r".{8,}")
 
 
 def ai_ready() -> bool:
